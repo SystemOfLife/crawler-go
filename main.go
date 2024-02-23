@@ -3,10 +3,12 @@ package main
 import (
 	"fmt"
 	"io"
+	"net"
 	"net/http"
 	"net/url"
 	"regexp"
 	"sync"
+	"time"
 )
 
 type Crawler struct {
@@ -14,24 +16,39 @@ type Crawler struct {
 	MaxVisits int
 	StartPage string
 	Filter    *regexp.Regexp
-	Visited   map[string]bool
+	Visited   map[string]bool // mb inteface, but than generate bool var every map check
+	Wg        *sync.WaitGroup
 	Mutex     *sync.Mutex
+	client    *http.Client
 }
 
 func NewCrawler(startPage string, filter *regexp.Regexp, maxDepth, maxVisits int) *Crawler {
+	t := &http.Transport{
+		Dial: (&net.Dialer{
+			Timeout:   5 * time.Second,
+			KeepAlive: 30 * time.Second,
+		}).Dial,
+
+		TLSHandshakeTimeout: 30 * time.Second,
+	}
+	c := &http.Client{
+		Transport: t,
+	}
 	return &Crawler{
 		StartPage: startPage,
 		MaxDepth:  maxDepth,
 		MaxVisits: maxVisits,
 		Filter:    filter,
+		client:    c,
 		Mutex:     new(sync.Mutex),
+		Wg:        new(sync.WaitGroup),
 		Visited:   make(map[string]bool),
 	}
 }
 
 // FetchPage just fetches the body Oo
 func (c *Crawler) fetchPage(pageURL string) ([]byte, error) {
-	resp, err := http.Get(pageURL) // TODO: mb add timeouts?
+	resp, err := c.client.Get(pageURL)
 	if err != nil {
 		return nil, err
 	}
@@ -51,7 +68,10 @@ func (c *Crawler) fetchPage(pageURL string) ([]byte, error) {
 
 // crawl recursively crawls the URL
 func (c *Crawler) crawl(pageURL string, depth int) {
-	if depth <= 0 || len(c.Visited) == c.MaxVisits { // to stop recursion or stop on limit. Ideally should use ctx.Done() on limit with gorutines
+	defer c.Wg.Done()
+
+	// to stop recursion or stop on limit. Ideally should use ctx.Done() on limit with gorutines
+	if depth <= 0 || len(c.Visited) == c.MaxVisits {
 		return
 	}
 
@@ -91,7 +111,8 @@ func (c *Crawler) crawl(pageURL string, depth int) {
 	}
 
 	for _, abs := range absLinks {
-		c.crawl(abs, depth-1)
+		c.Wg.Add(1)
+		go c.crawl(abs, depth-1)
 	}
 }
 
@@ -109,6 +130,7 @@ func (c *Crawler) getAbsoluteURL(baseURL, link string) (string, error) {
 }
 
 func (c *Crawler) Start() {
+	c.Wg.Add(1)
 	c.crawl(c.StartPage, c.MaxDepth)
 }
 
@@ -119,9 +141,11 @@ func (c *Crawler) isAllowed(URL string) bool {
 func main() {
 	filter := regexp.MustCompile("https://github.com/.+")
 
-	crawler := NewCrawler("https://github.com/axi0mX/ipwndfu/issues/141", filter, 2, 100)
+	crawler := NewCrawler("https://github.com/axi0mX/ipwndfu/issues/141", filter, 2, 100) // with depth 3 need to add backoff
 
 	crawler.Start()
+
+	crawler.Wg.Wait()
 
 	fmt.Printf("End of crawling. Number of visited links: %d\n", len(crawler.Visited))
 }
