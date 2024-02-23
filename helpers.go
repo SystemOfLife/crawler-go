@@ -23,8 +23,8 @@ func ExtractLinks(htmlContent []byte) ([]string, error) {
 			token := tokenizer.Token()
 			if token.Data == "a" {
 				for _, attr := range token.Attr {
-					if attr.Key == "href" && attr.Val != "" {
-						if string(attr.Val)[0:1] != "#" {
+					if attr.Key == "href" && attr.Val != "" { // cut same URL before checking visited map
+						if string(attr.Val)[0:1] != "#" { // TODO is there a problem?
 							links = append(links, attr.Val)
 						}
 					}

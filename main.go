@@ -5,28 +5,33 @@ import (
 	"io"
 	"net/http"
 	"net/url"
+	"regexp"
 	"sync"
 )
 
-// Crawler represents our web crawler.
 type Crawler struct {
 	MaxDepth  int
 	MaxVisits int
+	StartPage string
+	Filter    *regexp.Regexp
 	Visited   map[string]bool
-	Mutex     sync.Mutex
+	Mutex     *sync.Mutex
 }
 
-func NewCrawler(domain string, maxDepth, maxVisits int) *Crawler {
+func NewCrawler(startPage string, filter *regexp.Regexp, maxDepth, maxVisits int) *Crawler {
 	return &Crawler{
+		StartPage: startPage,
 		MaxDepth:  maxDepth,
 		MaxVisits: maxVisits,
+		Filter:    filter,
+		Mutex:     new(sync.Mutex),
 		Visited:   make(map[string]bool),
 	}
 }
 
 // FetchPage just fetches the body Oo
-func (c *Crawler) FetchPage(pageURL string) ([]byte, error) {
-	resp, err := http.Get(pageURL)
+func (c *Crawler) fetchPage(pageURL string) ([]byte, error) {
+	resp, err := http.Get(pageURL) // TODO: mb add timeouts?
 	if err != nil {
 		return nil, err
 	}
@@ -44,9 +49,9 @@ func (c *Crawler) FetchPage(pageURL string) ([]byte, error) {
 	return body, nil
 }
 
-// Crawl recursively crawls the URL
-func (c *Crawler) Crawl(pageURL string, depth int) {
-	if depth <= 0 || len(c.Visited) == c.MaxVisits { // to stop recursion or limit
+// crawl recursively crawls the URL
+func (c *Crawler) crawl(pageURL string, depth int) {
+	if depth <= 0 || len(c.Visited) == c.MaxVisits { // to stop recursion or stop on limit. Ideally should use ctx.Done() on limit with gorutines
 		return
 	}
 
@@ -60,7 +65,7 @@ func (c *Crawler) Crawl(pageURL string, depth int) {
 
 	fmt.Printf("Crawling: %s\n", pageURL)
 
-	body, err := c.FetchPage(pageURL)
+	body, err := c.fetchPage(pageURL)
 	if err != nil {
 		fmt.Printf("Error fetching page %s: %s\n", pageURL, err)
 		return
@@ -74,21 +79,23 @@ func (c *Crawler) Crawl(pageURL string, depth int) {
 
 	absLinks := make([]string, 0, len(links))
 
-	for _, link := range links {
-		absLink, err := c.AbsoluteURL(pageURL, link)
+	for _, link := range links { // mb should invoke crawl not in loop
+		absLink, err := c.getAbsoluteURL(pageURL, link)
 		if err != nil {
-			fmt.Printf("Error processing link %s: %s\n", link, err)
+			fmt.Printf("Crawler.getAbsoluteURL: Error processing link %s: %s\n", link, err)
 			continue
 		}
-		absLinks = append(absLinks, absLink)
+		if c.isAllowed(absLink) {
+			absLinks = append(absLinks, absLink)
+		}
 	}
 
 	for _, abs := range absLinks {
-		c.Crawl(abs, depth-1)
+		c.crawl(abs, depth-1)
 	}
 }
 
-func (c *Crawler) AbsoluteURL(baseURL, link string) (string, error) {
+func (c *Crawler) getAbsoluteURL(baseURL, link string) (string, error) {
 	base, err := url.Parse(baseURL)
 	if err != nil {
 		return "", err
@@ -101,12 +108,20 @@ func (c *Crawler) AbsoluteURL(baseURL, link string) (string, error) {
 	return absURL.String(), nil
 }
 
+func (c *Crawler) Start() {
+	c.crawl(c.StartPage, c.MaxDepth)
+}
+
+func (c *Crawler) isAllowed(URL string) bool {
+	return c.Filter.MatchString(URL)
+}
+
 func main() {
-	crawler := NewCrawler("", 2, 100)
+	filter := regexp.MustCompile("https://github.com/.+")
 
-	rootURL := "https://github.com/axi0mX/ipwndfu/issues/141"
-	crawler.Crawl(rootURL, crawler.MaxDepth)
+	crawler := NewCrawler("https://github.com/axi0mX/ipwndfu/issues/141", filter, 2, 100)
 
-	fmt.Println()
-	fmt.Printf("End of crawling. Number of visited links: %d", len(crawler.Visited))
+	crawler.Start()
+
+	fmt.Printf("End of crawling. Number of visited links: %d\n", len(crawler.Visited))
 }
