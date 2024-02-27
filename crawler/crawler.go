@@ -8,21 +8,24 @@ import (
 	"net/http"
 	"net/url"
 	"regexp"
+	"strings"
 	"sync"
 	"time"
 
+	"github.com/cavaliergopher/grab/v3"
 	"golang.org/x/net/html"
 )
 
 type Crawler struct {
-	maxDepth  int
-	maxVisits int
-	startPage string
-	filter    *regexp.Regexp
-	Visited   map[string]bool // mb inteface, but than generate bool var every map check
-	Wg        *sync.WaitGroup
-	mutex     *sync.Mutex
-	client    *http.Client
+	maxDepth   int
+	maxVisits  int
+	startPage  string
+	filter     *regexp.Regexp
+	Visited    map[string]bool // mb inteface, but than generate bool var every map check
+	Wg         *sync.WaitGroup
+	mutex      *sync.Mutex
+	client     *http.Client
+	grabClient *grab.Client
 }
 
 func NewCrawler(startPage string, filter *regexp.Regexp, maxDepth, maxVisits int) *Crawler {
@@ -34,22 +37,28 @@ func NewCrawler(startPage string, filter *regexp.Regexp, maxDepth, maxVisits int
 
 		TLSHandshakeTimeout: 30 * time.Second,
 	}
-	c := &http.Client{
+	c := grab.NewClient()
+	ua := "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.3"
+	c.UserAgent = ua
+
+	defaultCLient := &http.Client{
 		Transport: t,
 	}
+
 	return &Crawler{
-		startPage: startPage,
-		maxDepth:  maxDepth,
-		maxVisits: maxVisits,
-		filter:    filter,
-		client:    c,
-		mutex:     new(sync.Mutex),
-		Wg:        new(sync.WaitGroup),
-		Visited:   make(map[string]bool, maxVisits),
+		startPage:  startPage,
+		maxDepth:   maxDepth,
+		maxVisits:  maxVisits,
+		filter:     filter,
+		client:     defaultCLient,
+		grabClient: c,
+		mutex:      new(sync.Mutex),
+		Wg:         new(sync.WaitGroup),
+		Visited:    make(map[string]bool, maxVisits),
 	}
 }
 
-// FetchPage just fetches the body Oo TODO: ue grab lib
+// FetchPage just fetches the body Oo
 func (c *Crawler) fetchPage(pageURL string) ([]byte, error) {
 	resp, err := c.client.Get(pageURL)
 	if err != nil {
@@ -61,6 +70,12 @@ func (c *Crawler) fetchPage(pageURL string) ([]byte, error) {
 		return nil, fmt.Errorf("failed to fetch page: %s", resp.Status)
 	}
 
+	contentType := resp.Header.Get("Content-Type")
+	if !strings.HasPrefix(contentType, "text/") {
+		// Skip non-text URLs
+		return nil, nil
+	}
+
 	body, err := io.ReadAll(resp.Body)
 	if err != nil {
 		return nil, err
@@ -69,7 +84,7 @@ func (c *Crawler) fetchPage(pageURL string) ([]byte, error) {
 	return body, nil
 }
 
-func (c *Crawler) extractLinks(pageURL string, htmlContent []byte, depth int) {
+func (c *Crawler) parseHTMLContent(pageURL string, htmlContent []byte, depth int) {
 	reader := bytes.NewReader(htmlContent)
 	tokenizer := html.NewTokenizer(reader)
 
@@ -99,7 +114,51 @@ func (c *Crawler) extractLinks(pageURL string, htmlContent []byte, depth int) {
 						}
 					}
 				}
+			} else if token.Data == "link" || token.Data == "script" {
+				var attrName, attrVal string
+				for _, attr := range token.Attr {
+					if attr.Key == "href" || attr.Key == "src" {
+						attrName = attr.Key
+						attrVal = attr.Val
+					}
+				}
+				if attrName != "" && attrVal != "" {
+					if strings.HasSuffix(attrVal, ".html") || strings.HasSuffix(attrVal, ".css") || strings.HasSuffix(attrVal, ".js") {
+						req, _ := grab.NewRequest(fmt.Sprintf("./data/%s", attrVal), attrVal)
+						c.grabClient.Do(req)
+					}
+				}
 			}
+		}
+	}
+}
+
+func (c *Crawler) regexpExtract(content []byte, pageURL string, depth int) {
+	re := regexp.MustCompile(`href="([^"]+)"|src="([^"]+)"`)
+
+	matches := re.FindAllStringSubmatch(string(content), -1)
+
+	var url string
+	for _, match := range matches {
+		if match[1] != "" {
+			url = match[1]
+		} else if match[2] != "" {
+			url = match[2]
+		}
+
+		absLink, err := c.getAbsoluteURL(pageURL, url)
+		if err != nil {
+			fmt.Printf("Crawler.getAbsoluteURL: Error processing link %s: %s\n", url, err)
+			continue
+		}
+
+		// TODO: need to parallerize download properly
+		req, _ := grab.NewRequest(fmt.Sprintf("./data/%s", url), absLink)
+		c.grabClient.Do(req)
+		// check regex and go deeper
+		if c.isAllowed(absLink) {
+			c.Wg.Add(1)
+			go c.crawl(absLink, depth-1)
 		}
 	}
 }
@@ -129,7 +188,7 @@ func (c *Crawler) crawl(pageURL string, depth int) {
 		return
 	}
 
-	c.extractLinks(pageURL, body, depth)
+	c.regexpExtract(body, pageURL, depth)
 }
 
 func (c *Crawler) getAbsoluteURL(baseURL, link string) (string, error) {
