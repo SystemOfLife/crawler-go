@@ -1,60 +1,40 @@
 package crawler
 
 import (
-	"bytes"
 	"fmt"
 	"io"
-	"net"
 	"net/http"
 	"net/url"
+	"os"
+	"path/filepath"
 	"regexp"
 	"strings"
 	"sync"
-	"time"
-
-	"github.com/cavaliergopher/grab/v3"
-	"golang.org/x/net/html"
 )
 
 type Crawler struct {
-	maxDepth   int
-	maxVisits  int
-	startPage  string
-	filter     *regexp.Regexp
-	Visited    map[string]bool // mb inteface, but than generate bool var every map check
-	Wg         *sync.WaitGroup
-	mutex      *sync.Mutex
-	client     *http.Client
-	grabClient *grab.Client
+	maxDepth  int
+	maxVisits int
+	startPage string
+	filter    *regexp.Regexp
+	Visited   map[string]bool // mb inteface, but than generate bool var every map check
+	Wg        *sync.WaitGroup
+	mutex     *sync.Mutex
+	client    *http.Client
 }
 
 func NewCrawler(startPage string, filter *regexp.Regexp, maxDepth, maxVisits int) *Crawler {
-	t := &http.Transport{
-		Dial: (&net.Dialer{
-			Timeout:   5 * time.Second,
-			KeepAlive: 30 * time.Second,
-		}).Dial,
-
-		TLSHandshakeTimeout: 30 * time.Second,
-	}
-	c := grab.NewClient()
-	ua := "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.3"
-	c.UserAgent = ua
-
-	defaultCLient := &http.Client{
-		Transport: t,
-	}
+	c := &http.Client{}
 
 	return &Crawler{
-		startPage:  startPage,
-		maxDepth:   maxDepth,
-		maxVisits:  maxVisits,
-		filter:     filter,
-		client:     defaultCLient,
-		grabClient: c,
-		mutex:      new(sync.Mutex),
-		Wg:         new(sync.WaitGroup),
-		Visited:    make(map[string]bool, maxVisits),
+		startPage: startPage,
+		maxDepth:  maxDepth,
+		maxVisits: maxVisits,
+		filter:    filter,
+		client:    c,
+		mutex:     new(sync.Mutex),
+		Wg:        new(sync.WaitGroup),
+		Visited:   make(map[string]bool, maxVisits),
 	}
 }
 
@@ -70,6 +50,7 @@ func (c *Crawler) fetchPage(pageURL string) ([]byte, error) {
 		return nil, fmt.Errorf("failed to fetch page: %s", resp.Status)
 	}
 
+	// Check text content-type in links
 	contentType := resp.Header.Get("Content-Type")
 	if !strings.HasPrefix(contentType, "text/") {
 		// Skip non-text URLs
@@ -84,77 +65,34 @@ func (c *Crawler) fetchPage(pageURL string) ([]byte, error) {
 	return body, nil
 }
 
-func (c *Crawler) parseHTMLContent(pageURL string, htmlContent []byte, depth int) {
-	reader := bytes.NewReader(htmlContent)
-	tokenizer := html.NewTokenizer(reader)
-
-	for {
-		tokenType := tokenizer.Next()
-		if tokenType == html.ErrorToken {
-			break
-		}
-
-		if tokenType == html.StartTagToken {
-			token := tokenizer.Token()
-			if token.Data == "a" {
-				for _, attr := range token.Attr {
-					if attr.Key == "href" && attr.Val != "" { // cut same URL before checking visited map
-						if string(attr.Val)[0:1] != "#" { // TODO: is there a problem?
-							absLink, err := c.getAbsoluteURL(pageURL, attr.Val)
-							if err != nil {
-								fmt.Printf("Crawler.getAbsoluteURL: Error processing link %s: %s\n", attr.Val, err)
-								continue
-							}
-
-							// check regex and go deeper
-							if c.isAllowed(absLink) {
-								c.Wg.Add(1)
-								go c.crawl(absLink, depth-1)
-							}
-						}
-					}
-				}
-			} else if token.Data == "link" || token.Data == "script" {
-				var attrName, attrVal string
-				for _, attr := range token.Attr {
-					if attr.Key == "href" || attr.Key == "src" {
-						attrName = attr.Key
-						attrVal = attr.Val
-					}
-				}
-				if attrName != "" && attrVal != "" {
-					if strings.HasSuffix(attrVal, ".html") || strings.HasSuffix(attrVal, ".css") || strings.HasSuffix(attrVal, ".js") {
-						req, _ := grab.NewRequest(fmt.Sprintf("./data/%s", attrVal), attrVal)
-						c.grabClient.Do(req)
-					}
-				}
-			}
-		}
-	}
-}
-
 func (c *Crawler) regexpExtract(content []byte, pageURL string, depth int) {
 	re := regexp.MustCompile(`href="([^"]+)"|src="([^"]+)"`)
 
 	matches := re.FindAllStringSubmatch(string(content), -1)
 
-	var url string
+	var matchedUrl string
 	for _, match := range matches {
 		if match[1] != "" {
-			url = match[1]
+			matchedUrl = match[1]
 		} else if match[2] != "" {
-			url = match[2]
+			matchedUrl = match[2]
 		}
 
-		absLink, err := c.getAbsoluteURL(pageURL, url)
+		absLink, err := c.getAbsoluteURL(pageURL, matchedUrl)
 		if err != nil {
-			fmt.Printf("Crawler.getAbsoluteURL: Error processing link %s: %s\n", url, err)
+			fmt.Printf("Crawler.getAbsoluteURL: Error processing link %s: %s\n", matchedUrl, err)
 			continue
 		}
 
-		// TODO: need to parallerize download properly
-		req, _ := grab.NewRequest(fmt.Sprintf("./data/%s", url), absLink)
-		c.grabClient.Do(req)
+		c.mutex.Lock() // protect map on both read/write
+		if c.Visited[absLink] {
+			c.mutex.Unlock()
+			continue
+		}
+		c.Visited[pageURL] = true
+		c.mutex.Unlock()
+
+		go c.downloadTextFile(pageURL)
 		// check regex and go deeper
 		if c.isAllowed(absLink) {
 			c.Wg.Add(1)
@@ -172,7 +110,7 @@ func (c *Crawler) crawl(pageURL string, depth int) {
 		return
 	}
 
-	c.mutex.Lock() // protect map
+	c.mutex.Lock() // protect map on both read/write
 	if c.Visited[pageURL] {
 		c.mutex.Unlock()
 		return
@@ -184,10 +122,10 @@ func (c *Crawler) crawl(pageURL string, depth int) {
 
 	body, err := c.fetchPage(pageURL)
 	if err != nil {
-		fmt.Printf("Error fetching page %s: %s\n", pageURL, err)
+		fmt.Printf("error fetching page %s: %s\n", pageURL, err)
 		return
 	}
-
+	go c.downloadTextFile(pageURL)
 	c.regexpExtract(body, pageURL, depth)
 }
 
@@ -211,4 +149,33 @@ func (c *Crawler) Start() {
 
 func (c *Crawler) isAllowed(URL string) bool {
 	return c.filter.MatchString(URL)
+}
+
+func (c *Crawler) downloadTextFile(pageURL string) {
+	c.Wg.Add(1)
+	defer c.Wg.Done()
+
+	// TODO need to delete second downloading for basic HTML in crawl method
+	resp, err := c.client.Get(pageURL)
+	if err != nil {
+		fmt.Printf("error download page %s: %s\n", pageURL, err)
+		return
+	}
+	defer resp.Body.Close()
+
+	// Check text content-type in links
+	contentType := resp.Header.Get("Content-Type")
+	if !strings.HasPrefix(contentType, "text/") {
+		return
+	}
+
+	fileName := filepath.Base(pageURL)
+	filePath := filepath.Join("./data/", fileName)
+	out, err := os.Create(filePath)
+	defer out.Close()
+
+	_, err = io.Copy(out, resp.Body)
+	if err != nil {
+		fmt.Printf("Error saving file %s: %s\n", filePath, err)
+	}
 }
