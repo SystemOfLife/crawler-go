@@ -26,9 +26,12 @@ type Crawler struct {
 	mutex      *sync.Mutex
 	client     *http.Client
 	grabClient *grab.Client
+	workers    int
+	reqch      chan *grab.Request
+	respch     chan *grab.Response
 }
 
-func NewCrawler(startPage string, filter *regexp.Regexp, maxDepth, maxVisits int) *Crawler {
+func NewCrawler(startPage string, filter *regexp.Regexp, maxDepth, maxVisits, workers int) *Crawler {
 	t := &http.Transport{
 		Dial: (&net.Dialer{
 			Timeout:   5 * time.Second,
@@ -55,6 +58,9 @@ func NewCrawler(startPage string, filter *regexp.Regexp, maxDepth, maxVisits int
 		mutex:      new(sync.Mutex),
 		Wg:         new(sync.WaitGroup),
 		Visited:    make(map[string]bool, maxVisits),
+		workers:    workers,
+		reqch:      make(chan *grab.Request),
+		respch:     make(chan *grab.Response),
 	}
 }
 
@@ -154,7 +160,7 @@ func (c *Crawler) regexpExtract(content []byte, pageURL string, depth int) {
 
 		// TODO: need to parallerize download properly
 		req, _ := grab.NewRequest(fmt.Sprintf("./data/%s", url), absLink)
-		c.grabClient.Do(req)
+		c.reqch <- req
 		// check regex and go deeper
 		if c.isAllowed(absLink) {
 			c.Wg.Add(1)
@@ -205,8 +211,24 @@ func (c *Crawler) getAbsoluteURL(baseURL, link string) (string, error) {
 }
 
 func (c *Crawler) Start() {
+	// reqch := make(chan *grab.Request)
+	// respch := make(chan *grab.Response)
+
+	for i := 0; i < c.workers; i++ {
+		c.Wg.Add(1)
+		go func() {
+			c.grabClient.DoChannel(c.reqch, c.respch)
+			c.Wg.Done()
+		}()
+	}
+
 	c.Wg.Add(1)
 	c.crawl(c.startPage, c.maxDepth)
+}
+
+func (c *Crawler) Close() {
+	close(c.reqch)
+	close(c.respch)
 }
 
 func (c *Crawler) isAllowed(URL string) bool {
